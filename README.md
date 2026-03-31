@@ -1,5 +1,15 @@
 # Claude Code Source Snapshot for Security Research
+# Claude Codes — EM Edition
 
+This is a customized version of the original Claude Code project, adapted and maintained by emmark.
+
+## About
+Claude Codes is an AI-assisted coding tool designed to help developers generate, refactor, and explore code from natural language prompts.
+
+## Disclaimer
+This version is independently maintained and is not affiliated with or endorsed by the original authors or Anthropic.
+
+Maintained by: Emmark
 > This repository mirrors a **publicly exposed Claude Code source snapshot** that became accessible on **March 31, 2026** through a source map exposure in the npm distribution. It is maintained for **educational, defensive security research, and software supply-chain analysis**.
 
 ---
