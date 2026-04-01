@@ -39,7 +39,7 @@ claw login
 
 | Feature | Status |
 |---------|--------|
-| API + streaming | ✅ |
+| Anthropic API + streaming | ✅ |
 | OAuth login/logout | ✅ |
 | Interactive REPL (rustyline) | ✅ |
 | Tool system (bash, read, write, edit, grep, glob) | ✅ |
@@ -47,8 +47,8 @@ claw login
 | Sub-agent orchestration | ✅ |
 | Todo tracking | ✅ |
 | Notebook editing | ✅ |
-| CLAW.md / project memory | ✅ |
-| Config file hierarchy (.claw.json) | ✅ |
+| CLAUDE.md / project memory | ✅ |
+| Config file hierarchy (.claude.json) | ✅ |
 | Permission system | ✅ |
 | MCP server lifecycle | ✅ |
 | Session persistence + resume | ✅ |
@@ -106,7 +106,7 @@ Commands:
 | `/model [name]` | Show or switch model |
 | `/permissions` | Show or switch permission mode |
 | `/config [section]` | Show config (env, hooks, model) |
-| `/memory` | Show CLAW.md contents |
+| `/memory` | Show CLAUDE.md contents |
 | `/diff` | Show git diff |
 | `/export [path]` | Export conversation |
 | `/session [id]` | Resume a previous session |
@@ -119,11 +119,11 @@ rust/
 ├── Cargo.toml              # Workspace root
 ├── Cargo.lock
 └── crates/
-    ├── api/                # API client + SSE streaming
+    ├── api/                # Anthropic API client + SSE streaming
     ├── commands/           # Shared slash-command registry
     ├── compat-harness/     # TS manifest extraction harness
     ├── runtime/            # Session, config, permissions, MCP, prompts
-    ├── claw-cli/   # Main CLI binary (`claw`)
+    ├── rusty-claude-cli/   # Main CLI binary (`claw`)
     └── tools/              # Built-in tool implementations
 ```
 
@@ -133,7 +133,7 @@ rust/
 - **commands** — Slash command definitions and help text generation
 - **compat-harness** — Extracts tool/prompt manifests from upstream TS source
 - **runtime** — `ConversationRuntime` agentic loop, `ConfigLoader` hierarchy, `Session` persistence, permission policy, MCP client, system prompt assembly, usage tracking
-- **claw-cli** — REPL, one-shot prompt, streaming display, tool call rendering, CLI argument parsing
+- **rusty-claude-cli** — REPL, one-shot prompt, streaming display, tool call rendering, CLI argument parsing
 - **tools** — Tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, REPL runtimes
 
 ## Stats

@@ -4,17 +4,17 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    read_base_url, AnthropicClient, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
-use plugins::PluginTool;
+use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader, ContentBlock,
+    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
+    PermissionPolicy, RuntimeConfig, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -57,54 +57,133 @@ pub struct ToolSpec {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RegisteredTool {
+    pub definition: ToolDefinition,
+    pub required_permission: PermissionMode,
+    handler: RegisteredToolHandler,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+enum RegisteredToolHandler {
+    Builtin,
+    Plugin(PluginTool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GlobalToolRegistry {
-    plugin_tools: Vec<PluginTool>,
+    entries: Vec<RegisteredTool>,
 }
 
 impl GlobalToolRegistry {
     #[must_use]
     pub fn builtin() -> Self {
         Self {
-            plugin_tools: Vec::new(),
+            entries: mvp_tool_specs()
+                .into_iter()
+                .map(|spec| RegisteredTool {
+                    definition: ToolDefinition {
+                        name: spec.name.to_string(),
+                        description: Some(spec.description.to_string()),
+                        input_schema: spec.input_schema,
+                    },
+                    required_permission: spec.required_permission,
+                    handler: RegisteredToolHandler::Builtin,
+                })
+                .collect(),
         }
     }
 
     pub fn with_plugin_tools(plugin_tools: Vec<PluginTool>) -> Result<Self, String> {
-        let builtin_names = mvp_tool_specs()
-            .into_iter()
-            .map(|spec| spec.name.to_string())
-            .collect::<BTreeSet<_>>();
-        let mut seen_plugin_names = BTreeSet::new();
+        let mut registry = Self::builtin();
+        let mut seen = registry
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    normalize_registry_tool_name(&entry.definition.name),
+                    entry.definition.name.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
-        for tool in &plugin_tools {
-            let name = tool.definition().name.clone();
-            if builtin_names.contains(&name) {
+        for tool in plugin_tools {
+            let normalized = normalize_registry_tool_name(&tool.definition().name);
+            if let Some(existing) = seen.get(&normalized) {
                 return Err(format!(
-                    "plugin tool `{name}` conflicts with a built-in tool name"
+                    "plugin tool `{}` from `{}` conflicts with already-registered tool `{existing}`",
+                    tool.definition().name,
+                    tool.plugin_id()
                 ));
             }
-            if !seen_plugin_names.insert(name.clone()) {
-                return Err(format!("duplicate plugin tool name `{name}`"));
-            }
+            seen.insert(normalized, tool.definition().name.clone());
+            registry.entries.push(RegisteredTool {
+                definition: ToolDefinition {
+                    name: tool.definition().name.clone(),
+                    description: tool.definition().description.clone(),
+                    input_schema: tool.definition().input_schema.clone(),
+                },
+                required_permission: permission_mode_from_plugin_tool(tool.required_permission())?,
+                handler: RegisteredToolHandler::Plugin(tool),
+            });
         }
 
-        Ok(Self { plugin_tools })
+        Ok(registry)
     }
 
-    pub fn normalize_allowed_tools(&self, values: &[String]) -> Result<Option<BTreeSet<String>>, String> {
+    #[must_use]
+    pub fn entries(&self) -> &[RegisteredTool] {
+        &self.entries
+    }
+
+    fn find_entry(&self, name: &str) -> Option<&RegisteredTool> {
+        let normalized = normalize_registry_tool_name(name);
+        self.entries.iter().find(|entry| {
+            normalize_registry_tool_name(entry.definition.name.as_str()) == normalized
+        })
+    }
+
+    #[must_use]
+    pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
+            })
+            .map(|entry| entry.definition.clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn permission_specs(
+        &self,
+        allowed_tools: Option<&BTreeSet<String>>,
+    ) -> Vec<(String, PermissionMode)> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
+            })
+            .map(|entry| (entry.definition.name.clone(), entry.required_permission))
+            .collect()
+    }
+
+    pub fn normalize_allowed_tools(
+        &self,
+        values: &[String],
+    ) -> Result<Option<BTreeSet<String>>, String> {
         if values.is_empty() {
             return Ok(None);
         }
 
-        let builtin_specs = mvp_tool_specs();
-        let canonical_names = builtin_specs
+        let canonical_names = self
+            .entries
             .iter()
-            .map(|spec| spec.name.to_string())
-            .chain(self.plugin_tools.iter().map(|tool| tool.definition().name.clone()))
+            .map(|entry| entry.definition.name.clone())
             .collect::<Vec<_>>();
         let mut name_map = canonical_names
             .iter()
-            .map(|name| (normalize_tool_name(name), name.clone()))
+            .map(|name| (normalize_registry_tool_name(name), name.clone()))
             .collect::<BTreeMap<_, _>>();
 
         for (alias, canonical) in [
@@ -114,7 +193,9 @@ impl GlobalToolRegistry {
             ("glob", "glob_search"),
             ("grep", "grep_search"),
         ] {
-            name_map.insert(alias.to_string(), canonical.to_string());
+            if canonical_names.iter().any(|name| name == canonical) {
+                name_map.insert(alias.to_string(), canonical.to_string());
+            }
         }
 
         let mut allowed = BTreeSet::new();
@@ -123,7 +204,7 @@ impl GlobalToolRegistry {
                 .split(|ch: char| ch == ',' || ch.is_whitespace())
                 .filter(|token| !token.is_empty())
             {
-                let normalized = normalize_tool_name(token);
+                let normalized = normalize_registry_tool_name(token);
                 let canonical = name_map.get(&normalized).ok_or_else(|| {
                     format!(
                         "unsupported tool in --allowedTools: {token} (expected one of: {})",
@@ -137,77 +218,74 @@ impl GlobalToolRegistry {
         Ok(Some(allowed))
     }
 
-    #[must_use]
-    pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
-        let builtin = mvp_tool_specs()
-            .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-            .map(|spec| ToolDefinition {
-                name: spec.name.to_string(),
-                description: Some(spec.description.to_string()),
-                input_schema: spec.input_schema,
-            });
-        let plugin = self
-            .plugin_tools
-            .iter()
-            .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
-            })
-            .map(|tool| ToolDefinition {
-                name: tool.definition().name.clone(),
-                description: tool.definition().description.clone(),
-                input_schema: tool.definition().input_schema.clone(),
-            });
-        builtin.chain(plugin).collect()
-    }
-
-    #[must_use]
-    pub fn permission_specs(
-        &self,
-        allowed_tools: Option<&BTreeSet<String>>,
-    ) -> Vec<(String, PermissionMode)> {
-        let builtin = mvp_tool_specs()
-            .into_iter()
-            .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-            .map(|spec| (spec.name.to_string(), spec.required_permission));
-        let plugin = self
-            .plugin_tools
-            .iter()
-            .filter(|tool| {
-                allowed_tools.is_none_or(|allowed| allowed.contains(tool.definition().name.as_str()))
-            })
-            .map(|tool| {
-                (
-                    tool.definition().name.clone(),
-                    permission_mode_from_plugin(tool.required_permission()),
-                )
-            });
-        builtin.chain(plugin).collect()
-    }
-
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
-        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool(name, input);
+        let entry = self
+            .find_entry(name)
+            .ok_or_else(|| format!("unsupported tool: {name}"))?;
+        match &entry.handler {
+            RegisteredToolHandler::Builtin => execute_tool(&entry.definition.name, input),
+            RegisteredToolHandler::Plugin(tool) => {
+                tool.execute(input).map_err(|error| error.to_string())
+            }
         }
-        self.plugin_tools
-            .iter()
-            .find(|tool| tool.definition().name == name)
-            .ok_or_else(|| format!("unsupported tool: {name}"))?
-            .execute(input)
-            .map_err(|error| error.to_string())
     }
 }
 
-fn normalize_tool_name(value: &str) -> String {
-    value.trim().replace('-', "_").to_ascii_lowercase()
+impl Default for GlobalToolRegistry {
+    fn default() -> Self {
+        Self::builtin()
+    }
 }
 
-fn permission_mode_from_plugin(value: &str) -> PermissionMode {
+fn normalize_registry_tool_name(value: &str) -> String {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    let mut normalized = String::new();
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if matches!(ch, '-' | ' ' | '\t' | '\n') {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            continue;
+        }
+
+        if ch == '_' {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            continue;
+        }
+
+        if ch.is_uppercase() {
+            let prev = chars.get(index.wrapping_sub(1)).copied();
+            let next = chars.get(index + 1).copied();
+            let needs_separator = index > 0
+                && !normalized.ends_with('_')
+                && (prev.is_some_and(|prev| prev.is_lowercase() || prev.is_ascii_digit())
+                    || (prev.is_some_and(char::is_uppercase)
+                        && next.is_some_and(char::is_lowercase)));
+            if needs_separator {
+                normalized.push('_');
+            }
+            normalized.extend(ch.to_lowercase());
+            continue;
+        }
+
+        normalized.push(ch.to_ascii_lowercase());
+    }
+
+    normalized.trim_matches('_').to_string()
+}
+
+fn permission_mode_from_plugin_tool(value: &str) -> Result<PermissionMode, String> {
     match value {
-        "read-only" => PermissionMode::ReadOnly,
-        "workspace-write" => PermissionMode::WorkspaceWrite,
-        "danger-full-access" => PermissionMode::DangerFullAccess,
-        other => panic!("unsupported plugin permission: {other}"),
+        "read-only" => Ok(PermissionMode::ReadOnly),
+        "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
+        "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
+        other => Err(format!(
+            "unsupported plugin tool permission `{other}` (expected read-only, workspace-write, or danger-full-access)"
+        )),
     }
 }
 
@@ -1081,7 +1159,7 @@ fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("claw-rust-tools/0.1")
+        .user_agent("clawd-rust-tools/0.1")
         .build()
         .map_err(|error| error.to_string())
 }
@@ -1102,7 +1180,7 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
 }
 
 fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
-    if let Ok(base) = std::env::var("CLAW_WEB_SEARCH_BASE_URL") {
+    if let Ok(base) = std::env::var("CLAWD_WEB_SEARCH_BASE_URL") {
         let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
         url.query_pairs_mut().append_pair("q", query);
         return Ok(url);
@@ -1447,11 +1525,11 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
 }
 
 fn todo_store_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAW_TODO_STORE") {
+    if let Ok(path) = std::env::var("CLAWD_TODO_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".claw-todos.json"))
+    Ok(cwd.join(".clawd-todos.json"))
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -1463,12 +1541,6 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     let mut candidates = Vec::new();
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::PathBuf::from(home);
-        candidates.push(home.join(".agents").join("skills"));
-        candidates.push(home.join(".config").join("opencode").join("skills"));
-        candidates.push(home.join(".codex").join("skills"));
     }
     candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
 
@@ -1584,7 +1656,7 @@ where
 }
 
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
-    let thread_name = format!("claw-agent-{}", job.manifest.agent_id);
+    let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
@@ -1621,20 +1693,22 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
 
 fn build_agent_runtime(
     job: &AgentJob,
-) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
+) -> Result<ConversationRuntime<AnthropicRuntimeClient, SubagentToolExecutor>, String> {
     let model = job
         .manifest
         .model
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
-    let tool_executor = SubagentToolExecutor::new(allowed_tools);
+    let tool_registry = current_tool_registry()?;
+    let api_client =
+        AnthropicRuntimeClient::new(model, allowed_tools.clone(), tool_registry.clone())?;
+    let tool_executor = SubagentToolExecutor::new(allowed_tools, tool_registry.clone());
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
         tool_executor,
-        agent_permission_policy(),
+        agent_permission_policy(&tool_registry),
         job.system_prompt.clone(),
     ))
 }
@@ -1699,7 +1773,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "SendUserMessage",
             "PowerShell",
         ],
-        "claw-guide" => vec![
+        "claw-code-guide" => vec![
             "read_file",
             "glob_search",
             "grep_search",
@@ -1743,10 +1817,12 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
     tools.into_iter().map(str::to_string).collect()
 }
 
-fn agent_permission_policy() -> PermissionPolicy {
-    mvp_tool_specs().into_iter().fold(
+fn agent_permission_policy(tool_registry: &GlobalToolRegistry) -> PermissionPolicy {
+    tool_registry.permission_specs(None).into_iter().fold(
         PermissionPolicy::new(PermissionMode::DangerFullAccess),
-        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        |policy, (name, required_permission)| {
+            policy.with_tool_requirement(name, required_permission)
+        },
     )
 }
 
@@ -1797,39 +1873,39 @@ fn format_agent_terminal_output(status: &str, result: Option<&str>, error: Optio
     sections.join("")
 }
 
-struct ProviderRuntimeClient {
+struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ProviderClient,
+    client: AnthropicClient,
     model: String,
     allowed_tools: BTreeSet<String>,
+    tool_registry: GlobalToolRegistry,
 }
 
-impl ProviderRuntimeClient {
-    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let model = resolve_model_alias(&model).to_string();
-        let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
+impl AnthropicRuntimeClient {
+    fn new(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        tool_registry: GlobalToolRegistry,
+    ) -> Result<Self, String> {
+        let client = AnthropicClient::from_env()
+            .map_err(|error| error.to_string())?
+            .with_base_url(read_base_url());
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             client,
             model,
             allowed_tools,
+            tool_registry,
         })
     }
 }
 
-impl ApiClient for ProviderRuntimeClient {
+impl ApiClient for AnthropicRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
-            .into_iter()
-            .map(|spec| ToolDefinition {
-                name: spec.name.to_string(),
-                description: Some(spec.description.to_string()),
-                input_schema: spec.input_schema,
-            })
-            .collect::<Vec<_>>();
+        let tools = self.tool_registry.definitions(Some(&self.allowed_tools));
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: 32_000,
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: (!tools.is_empty()).then_some(tools),
@@ -1844,7 +1920,7 @@ impl ApiClient for ProviderRuntimeClient {
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             let mut events = Vec::new();
-            let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+            let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
 
             while let Some(event) = stream
@@ -1855,15 +1931,14 @@ impl ApiClient for ProviderRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, 0, &mut events, &mut pending_tools, true);
+                            push_output_block(block, &mut events, &mut pending_tool, true);
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
                         push_output_block(
                             start.content_block,
-                            start.index,
                             &mut events,
-                            &mut pending_tools,
+                            &mut pending_tool,
                             true,
                         );
                     }
@@ -1874,15 +1949,15 @@ impl ApiClient for ProviderRuntimeClient {
                             }
                         }
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
-                            if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
+                            if let Some((_, _, input)) = &mut pending_tool {
                                 input.push_str(&partial_json);
                             }
                         }
                         ContentBlockDelta::ThinkingDelta { .. }
                         | ContentBlockDelta::SignatureDelta { .. } => {}
                     },
-                    ApiStreamEvent::ContentBlockStop(stop) => {
-                        if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
+                    ApiStreamEvent::ContentBlockStop(_) => {
+                        if let Some((id, name, input)) = pending_tool.take() {
                             events.push(AssistantEvent::ToolUse { id, name, input });
                         }
                     }
@@ -1932,32 +2007,82 @@ impl ApiClient for ProviderRuntimeClient {
 
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
+    tool_registry: GlobalToolRegistry,
 }
 
 impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self { allowed_tools }
+    fn new(allowed_tools: BTreeSet<String>, tool_registry: GlobalToolRegistry) -> Self {
+        Self {
+            allowed_tools,
+            tool_registry,
+        }
     }
 }
 
 impl ToolExecutor for SubagentToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if !self.allowed_tools.contains(tool_name) {
+        let entry = self
+            .tool_registry
+            .find_entry(tool_name)
+            .ok_or_else(|| ToolError::new(format!("unsupported tool: {tool_name}")))?;
+        if !self.allowed_tools.contains(entry.definition.name.as_str()) {
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` is not enabled for this sub-agent"
             )));
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool(tool_name, &value).map_err(ToolError::new)
+        self.tool_registry
+            .execute(tool_name, &value)
+            .map_err(ToolError::new)
     }
 }
 
-fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolSpec> {
-    mvp_tool_specs()
-        .into_iter()
-        .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
-        .collect()
+fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load().map_err(|error| error.to_string())?;
+    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_tools = plugin_manager
+        .aggregated_tools()
+        .map_err(|error| error.to_string())?;
+    GlobalToolRegistry::with_plugin_tools(plugin_tools)
+}
+
+fn build_plugin_manager(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &RuntimeConfig,
+) -> PluginManager {
+    let plugin_settings = runtime_config.plugins();
+    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    plugin_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
+        .collect();
+    plugin_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    PluginManager::new(plugin_config)
+}
+
+fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -2003,9 +2128,8 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 
 fn push_output_block(
     block: OutputContentBlock,
-    block_index: u32,
     events: &mut Vec<AssistantEvent>,
-    pending_tools: &mut BTreeMap<u32, (String, String, String)>,
+    pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
 ) {
     match block {
@@ -2023,7 +2147,7 @@ fn push_output_block(
             } else {
                 input.to_string()
             };
-            pending_tools.insert(block_index, (id, name, initial_input));
+            *pending_tool = Some((id, name, initial_input));
         }
         OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
     }
@@ -2031,12 +2155,11 @@ fn push_output_block(
 
 fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
     let mut events = Vec::new();
-    let mut pending_tools = BTreeMap::new();
+    let mut pending_tool = None;
 
-    for (index, block) in response.content.into_iter().enumerate() {
-        let index = u32::try_from(index).expect("response block index overflow");
-        push_output_block(block, index, &mut events, &mut pending_tools, false);
-        if let Some((id, name, input)) = pending_tools.remove(&index) {
+    for block in response.content {
+        push_output_block(block, &mut events, &mut pending_tool, false);
+        if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
     }
@@ -2206,14 +2329,14 @@ fn canonical_tool_token(value: &str) -> String {
 }
 
 fn agent_store_dir() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAW_AGENT_STORE") {
+    if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".claw-agents"));
+        return Ok(workspace_root.join(".clawd-agents"));
     }
-    Ok(cwd.join(".claw-agents"))
+    Ok(cwd.join(".clawd-agents"))
 }
 
 fn make_agent_id() -> String {
@@ -2254,7 +2377,7 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
         "verification" | "verificationagent" | "verify" | "verifier" => {
             String::from("Verification")
         }
-        "clawguide" | "clawguideagent" | "guide" => String::from("claw-guide"),
+        "claudecodeguide" | "claudecodeguideagent" | "guide" => String::from("claw-code-guide"),
         "statusline" | "statuslinesetup" => String::from("statusline-setup"),
         _ => trimmed.to_string(),
     }
@@ -2754,16 +2877,16 @@ fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     Ok(match scope {
         ConfigScope::Global => config_home_dir()?.join("settings.json"),
-        ConfigScope::Settings => cwd.join(".claw").join("settings.local.json"),
+        ConfigScope::Settings => cwd.join(".claude").join("settings.local.json"),
     })
 }
 
 fn config_home_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("CLAW_CONFIG_HOME") {
+    if let Ok(path) = std::env::var("CLAUDE_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".claw"))
+    Ok(PathBuf::from(home).join(".claude"))
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
@@ -3060,7 +3183,6 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::fs;
     use std::io::{Read, Write};
@@ -3073,10 +3195,13 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
         execute_tool, final_assistant_text, mvp_tool_specs, persist_agent_terminal_state,
-        push_output_block, AgentInput, AgentJob, SubagentToolExecutor,
+        response_to_events, AgentInput, AgentJob, GlobalToolRegistry, SubagentToolExecutor,
     };
-    use api::OutputContentBlock;
-    use runtime::{ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session};
+    use api::{MessageResponse, OutputContentBlock, Usage};
+    use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
+    use runtime::{
+        ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session, ToolExecutor,
+    };
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3089,7 +3214,18 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("claw-tools-{unique}-{name}"))
+        std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn make_executable(path: &PathBuf) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("chmod");
+        }
     }
 
     #[test]
@@ -3119,6 +3255,170 @@ mod tests {
     fn rejects_unknown_tool_names() {
         let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
+    }
+
+    #[test]
+    fn global_registry_registers_and_executes_plugin_tools() {
+        let script = temp_path("plugin-tool.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+        )
+        .expect("write script");
+        make_executable(&script);
+
+        let registry = GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
+            "demo@external",
+            "demo",
+            PluginToolDefinition {
+                name: "plugin_echo".to_string(),
+                description: Some("Echo plugin input".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "message": { "type": "string" } },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }),
+            },
+            "sh".to_string(),
+            vec![script.display().to_string()],
+            PluginToolPermission::WorkspaceWrite,
+            script.parent().map(PathBuf::from),
+        )])
+        .expect("registry should build");
+
+        let names = registry
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"bash".to_string()));
+        assert!(names.contains(&"plugin_echo".to_string()));
+
+        let output = registry
+            .execute("plugin_echo", &json!({ "message": "hello" }))
+            .expect("plugin tool should execute");
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(payload["plugin"], "demo@external");
+        assert_eq!(payload["tool"], "plugin_echo");
+        assert_eq!(payload["input"]["message"], "hello");
+
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[test]
+    fn global_registry_normalizes_plugin_tool_names_for_allowlists_and_execution() {
+        let script = temp_path("plugin-tool-normalized.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+        )
+        .expect("write script");
+        make_executable(&script);
+
+        let registry = GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
+            "demo@external",
+            "demo",
+            PluginToolDefinition {
+                name: "plugin_echo".to_string(),
+                description: Some("Echo plugin input".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "message": { "type": "string" } },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }),
+            },
+            script.display().to_string(),
+            Vec::new(),
+            PluginToolPermission::WorkspaceWrite,
+            script.parent().map(PathBuf::from),
+        )])
+        .expect("registry should build");
+
+        let allowed = registry
+            .normalize_allowed_tools(&[String::from("PLUGIN-ECHO")])
+            .expect("plugin tool allowlist should normalize")
+            .expect("allowlist should be present");
+        assert!(allowed.contains("plugin_echo"));
+
+        let output = registry
+            .execute("plugin-echo", &json!({ "message": "hello" }))
+            .expect("normalized plugin tool name should execute");
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(payload["tool"], "plugin_echo");
+        assert_eq!(payload["input"]["message"], "hello");
+
+        let builtin_output = GlobalToolRegistry::builtin()
+            .execute("structured-output", &json!({ "ok": true }))
+            .expect("normalized builtin tool name should execute");
+        let builtin_payload: serde_json::Value =
+            serde_json::from_str(&builtin_output).expect("valid json");
+        assert_eq!(builtin_payload["structured_output"]["ok"], true);
+
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[test]
+    fn subagent_executor_executes_allowed_plugin_tools() {
+        let script = temp_path("subagent-plugin-tool.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+        )
+        .expect("write script");
+        make_executable(&script);
+
+        let registry = GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
+            "demo@external",
+            "demo",
+            PluginToolDefinition {
+                name: "plugin_echo".to_string(),
+                description: Some("Echo plugin input".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "message": { "type": "string" } },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }),
+            },
+            script.display().to_string(),
+            Vec::new(),
+            PluginToolPermission::WorkspaceWrite,
+            script.parent().map(PathBuf::from),
+        )])
+        .expect("registry should build");
+
+        let mut executor =
+            SubagentToolExecutor::new(BTreeSet::from([String::from("plugin_echo")]), registry);
+        let output = executor
+            .execute("plugin-echo", r#"{"message":"hello"}"#)
+            .expect("plugin tool should execute for subagent");
+        let payload: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(payload["tool"], "plugin_echo");
+        assert_eq!(payload["input"]["message"], "hello");
+
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[test]
+    fn global_registry_rejects_conflicting_plugin_tool_names() {
+        let error = GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
+            "demo@external",
+            "demo",
+            PluginToolDefinition {
+                name: "read-file".to_string(),
+                description: Some("Conflicts with builtin".to_string()),
+                input_schema: json!({ "type": "object" }),
+            },
+            "echo".to_string(),
+            Vec::new(),
+            PluginToolPermission::ReadOnly,
+            None,
+        )])
+        .expect_err("conflicting plugin tool should fail");
+
+        assert!(error.contains("conflicts with already-registered tool `read_file`"));
     }
 
     #[test]
@@ -3212,7 +3512,7 @@ mod tests {
         }));
 
         std::env::set_var(
-            "CLAW_WEB_SEARCH_BASE_URL",
+            "CLAWD_WEB_SEARCH_BASE_URL",
             format!("http://{}/search", server.addr()),
         );
         let result = execute_tool(
@@ -3224,7 +3524,7 @@ mod tests {
             }),
         )
         .expect("WebSearch should succeed");
-        std::env::remove_var("CLAW_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["query"], "rust web search");
@@ -3260,7 +3560,7 @@ mod tests {
         }));
 
         std::env::set_var(
-            "CLAW_WEB_SEARCH_BASE_URL",
+            "CLAWD_WEB_SEARCH_BASE_URL",
             format!("http://{}/fallback", server.addr()),
         );
         let result = execute_tool(
@@ -3270,7 +3570,7 @@ mod tests {
             }),
         )
         .expect("WebSearch fallback parsing should succeed");
-        std::env::remove_var("CLAW_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         let results = output["results"].as_array().expect("results array");
@@ -3283,68 +3583,11 @@ mod tests {
         assert_eq!(content[0]["url"], "https://example.com/one");
         assert_eq!(content[1]["url"], "https://docs.rs/tokio");
 
-        std::env::set_var("CLAW_WEB_SEARCH_BASE_URL", "://bad-base-url");
+        std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
             .expect_err("invalid base URL should fail");
-        std::env::remove_var("CLAW_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
-    }
-
-    #[test]
-    fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
-        let mut events = Vec::new();
-        let mut pending_tools = BTreeMap::new();
-
-        push_output_block(
-            OutputContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "read_file".to_string(),
-                input: json!({}),
-            },
-            1,
-            &mut events,
-            &mut pending_tools,
-            true,
-        );
-        push_output_block(
-            OutputContentBlock::ToolUse {
-                id: "tool-2".to_string(),
-                name: "grep_search".to_string(),
-                input: json!({}),
-            },
-            2,
-            &mut events,
-            &mut pending_tools,
-            true,
-        );
-
-        pending_tools
-            .get_mut(&1)
-            .expect("first tool pending")
-            .2
-            .push_str("{\"path\":\"src/main.rs\"}");
-        pending_tools
-            .get_mut(&2)
-            .expect("second tool pending")
-            .2
-            .push_str("{\"pattern\":\"TODO\"}");
-
-        assert_eq!(
-            pending_tools.remove(&1),
-            Some((
-                "tool-1".to_string(),
-                "read_file".to_string(),
-                "{\"path\":\"src/main.rs\"}".to_string(),
-            ))
-        );
-        assert_eq!(
-            pending_tools.remove(&2),
-            Some((
-                "tool-2".to_string(),
-                "grep_search".to_string(),
-                "{\"pattern\":\"TODO\"}".to_string(),
-            ))
-        );
     }
 
     #[test]
@@ -3353,7 +3596,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("todos.json");
-        std::env::set_var("CLAW_TODO_STORE", &path);
+        std::env::set_var("CLAWD_TODO_STORE", &path);
 
         let first = execute_tool(
             "TodoWrite",
@@ -3379,7 +3622,7 @@ mod tests {
             }),
         )
         .expect("TodoWrite should succeed");
-        std::env::remove_var("CLAW_TODO_STORE");
+        std::env::remove_var("CLAWD_TODO_STORE");
         let _ = std::fs::remove_file(path);
 
         let second_output: serde_json::Value = serde_json::from_str(&second).expect("valid json");
@@ -3400,7 +3643,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = temp_path("todos-errors.json");
-        std::env::set_var("CLAW_TODO_STORE", &path);
+        std::env::set_var("CLAWD_TODO_STORE", &path);
 
         let empty = execute_tool("TodoWrite", &json!({ "todos": [] }))
             .expect_err("empty todos should fail");
@@ -3440,7 +3683,7 @@ mod tests {
             }),
         )
         .expect("completed todos should succeed");
-        std::env::remove_var("CLAW_TODO_STORE");
+        std::env::remove_var("CLAWD_TODO_STORE");
         let _ = fs::remove_file(path);
 
         let output: serde_json::Value = serde_json::from_str(&nudge).expect("valid json");
@@ -3449,9 +3692,6 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "Skill",
             &json!({
@@ -3527,7 +3767,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-store");
-        std::env::set_var("CLAW_AGENT_STORE", &dir);
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
         let captured = Arc::new(Mutex::new(None::<AgentJob>));
         let captured_for_spawn = Arc::clone(&captured);
 
@@ -3547,7 +3787,7 @@ mod tests {
             },
         )
         .expect("Agent should succeed");
-        std::env::remove_var("CLAW_AGENT_STORE");
+        std::env::remove_var("CLAWD_AGENT_STORE");
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
@@ -3604,7 +3844,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-runner");
-        std::env::set_var("CLAW_AGENT_STORE", &dir);
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
 
         let completed = execute_agent_with_spawn(
             AgentInput {
@@ -3686,7 +3926,7 @@ mod tests {
         assert!(spawn_error_manifest.contains("\"status\": \"failed\""));
         assert!(spawn_error_manifest.contains("thread creation failed"));
 
-        std::env::remove_var("CLAW_AGENT_STORE");
+        std::env::remove_var("CLAWD_AGENT_STORE");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3760,8 +4000,11 @@ mod tests {
                 calls: 0,
                 input_path: path.display().to_string(),
             },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
-            agent_permission_policy(),
+            SubagentToolExecutor::new(
+                BTreeSet::from([String::from("read_file")]),
+                GlobalToolRegistry::builtin(),
+            ),
+            agent_permission_policy(&GlobalToolRegistry::builtin()),
             vec![String::from("system prompt")],
         );
 
@@ -3785,6 +4028,42 @@ mod tests {
             )));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn response_to_events_ignores_thinking_blocks() {
+        let events = response_to_events(MessageResponse {
+            id: "msg-1".to_string(),
+            kind: "message".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            role: "assistant".to_string(),
+            content: vec![
+                OutputContentBlock::Thinking {
+                    thinking: "step 1".to_string(),
+                    signature: Some("sig_123".to_string()),
+                },
+                OutputContentBlock::Text {
+                    text: "Final answer".to_string(),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            request_id: None,
+        });
+
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::TextDelta(text) if text == "Final answer"
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::ToolUse { .. })));
     }
 
     #[test]
@@ -4172,7 +4451,7 @@ mod tests {
     #[test]
     fn brief_returns_sent_message_and_attachment_metadata() {
         let attachment = std::env::temp_dir().join(format!(
-            "claw-brief-{}.png",
+            "clawd-brief-{}.png",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -4203,7 +4482,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
-            "claw-config-{}",
+            "clawd-config-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -4211,19 +4490,19 @@ mod tests {
         ));
         let home = root.join("home");
         let cwd = root.join("cwd");
-        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
-        std::fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
+        std::fs::create_dir_all(home.join(".claude")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".claude")).expect("cwd dir");
         std::fs::write(
-            home.join(".claw").join("settings.json"),
+            home.join(".claude").join("settings.json"),
             r#"{"verbose":false}"#,
         )
         .expect("write global settings");
 
         let original_home = std::env::var("HOME").ok();
-        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_claude_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
         let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
@@ -4256,9 +4535,9 @@ mod tests {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
-        match original_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        match original_claude_home {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4292,7 +4571,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!(
-            "claw-pwsh-bin-{}",
+            "clawd-pwsh-bin-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -4349,7 +4628,7 @@ printf 'pwsh:%s' "$1"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_path = std::env::var("PATH").unwrap_or_default();
         let empty_dir = std::env::temp_dir().join(format!(
-            "claw-empty-bin-{}",
+            "clawd-empty-bin-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")

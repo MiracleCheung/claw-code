@@ -21,7 +21,7 @@ pub struct BootstrapPlan {
 
 impl BootstrapPlan {
     #[must_use]
-    pub fn claw_default() -> Self {
+    pub fn claude_code_default() -> Self {
         Self::from_phases(vec![
             BootstrapPhase::CliEntry,
             BootstrapPhase::FastPathVersion,

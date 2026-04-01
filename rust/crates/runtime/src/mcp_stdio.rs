@@ -809,7 +809,6 @@ mod tests {
     use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -1138,37 +1137,15 @@ mod tests {
 
     fn script_transport(script_path: &Path) -> crate::mcp_client::McpStdioTransport {
         crate::mcp_client::McpStdioTransport {
-            command: python_command(),
+            command: "python3".to_string(),
             args: vec![script_path.to_string_lossy().into_owned()],
             env: BTreeMap::new(),
         }
     }
 
-    fn python_command() -> String {
-        for key in ["MCP_TEST_PYTHON", "PYTHON3", "PYTHON"] {
-            if let Ok(value) = std::env::var(key) {
-                if !value.trim().is_empty() {
-                    return value;
-                }
-            }
-        }
-
-        for candidate in ["python3", "python"] {
-            if Command::new(candidate).arg("--version").output().is_ok() {
-                return candidate.to_string();
-            }
-        }
-
-        panic!("expected a Python interpreter for MCP stdio tests")
-    }
-
     fn cleanup_script(script_path: &Path) {
-        if let Err(error) = fs::remove_file(script_path) {
-            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "cleanup script");
-        }
-        if let Err(error) = fs::remove_dir_all(script_path.parent().expect("script parent")) {
-            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "cleanup dir");
-        }
+        fs::remove_file(script_path).expect("cleanup script");
+        fs::remove_dir_all(script_path.parent().expect("script parent")).expect("cleanup dir");
     }
 
     fn manager_server_config(
@@ -1179,7 +1156,7 @@ mod tests {
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: python_command(),
+                command: "python3".to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([
                     ("MCP_SERVER_LABEL".to_string(), label.to_string()),

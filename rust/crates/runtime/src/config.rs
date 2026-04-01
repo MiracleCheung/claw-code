@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
-pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
+pub const CLAUDE_CODE_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
@@ -52,6 +52,7 @@ pub struct RuntimeFeatureConfig {
     oauth: Option<OAuthConfig>,
     model: Option<String>,
     permission_mode: Option<ResolvedPermissionMode>,
+    permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
 }
 
@@ -59,6 +60,14 @@ pub struct RuntimeFeatureConfig {
 pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
+    post_tool_use_failure: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimePermissionRuleConfig {
+    allow: Vec<String>,
+    deny: Vec<String>,
+    ask: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -79,7 +88,7 @@ pub enum McpTransport {
     Http,
     Ws,
     Sdk,
-    ManagedProxy,
+    ClaudeAiProxy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +98,7 @@ pub enum McpServerConfig {
     Http(McpRemoteServerConfig),
     Ws(McpWebSocketServerConfig),
     Sdk(McpSdkServerConfig),
-    ManagedProxy(McpManagedProxyServerConfig),
+    ClaudeAiProxy(McpClaudeAiProxyServerConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +129,7 @@ pub struct McpSdkServerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpManagedProxyServerConfig {
+pub struct McpClaudeAiProxyServerConfig {
     pub url: String,
     pub id: String,
 }
@@ -196,8 +205,8 @@ impl ConfigLoader {
     #[must_use]
     pub fn discover(&self) -> Vec<ConfigEntry> {
         let user_legacy_path = self.config_home.parent().map_or_else(
-            || PathBuf::from(".claw.json"),
-            |parent| parent.join(".claw.json"),
+            || PathBuf::from(".claude.json"),
+            |parent| parent.join(".claude.json"),
         );
         vec![
             ConfigEntry {
@@ -210,15 +219,15 @@ impl ConfigLoader {
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw.json"),
+                path: self.cwd.join(".claude.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw").join("settings.json"),
+                path: self.cwd.join(".claude").join("settings.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Local,
-                path: self.cwd.join(".claw").join("settings.local.json"),
+                path: self.cwd.join(".claude").join("settings.local.json"),
             },
         ]
     }
@@ -248,6 +257,7 @@ impl ConfigLoader {
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
             permission_mode: parse_optional_permission_mode(&merged_value)?,
+            permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
         };
 
@@ -325,6 +335,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn permission_rules(&self) -> &RuntimePermissionRuleConfig {
+        &self.feature_config.permission_rules
+    }
+
+    #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
     }
@@ -374,6 +389,11 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn permission_rules(&self) -> &RuntimePermissionRuleConfig {
+        &self.permission_rules
+    }
+
+    #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.sandbox
     }
@@ -420,18 +440,23 @@ impl RuntimePluginConfig {
 
 #[must_use]
 pub fn default_config_home() -> PathBuf {
-    std::env::var_os("CLAW_CONFIG_HOME")
+    std::env::var_os("CLAUDE_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
-        .unwrap_or_else(|| PathBuf::from(".claw"))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .unwrap_or_else(|| PathBuf::from(".claude"))
 }
 
 impl RuntimeHookConfig {
     #[must_use]
-    pub fn new(pre_tool_use: Vec<String>, post_tool_use: Vec<String>) -> Self {
+    pub fn new(
+        pre_tool_use: Vec<String>,
+        post_tool_use: Vec<String>,
+        post_tool_use_failure: Vec<String>,
+    ) -> Self {
         Self {
             pre_tool_use,
             post_tool_use,
+            post_tool_use_failure,
         }
     }
 
@@ -446,6 +471,11 @@ impl RuntimeHookConfig {
     }
 
     #[must_use]
+    pub fn post_tool_use_failure(&self) -> &[String] {
+        &self.post_tool_use_failure
+    }
+
+    #[must_use]
     pub fn merged(&self, other: &Self) -> Self {
         let mut merged = self.clone();
         merged.extend(other);
@@ -455,6 +485,32 @@ impl RuntimeHookConfig {
     pub fn extend(&mut self, other: &Self) {
         extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
         extend_unique(&mut self.post_tool_use, other.post_tool_use());
+        extend_unique(
+            &mut self.post_tool_use_failure,
+            other.post_tool_use_failure(),
+        );
+    }
+}
+
+impl RuntimePermissionRuleConfig {
+    #[must_use]
+    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
+        Self { allow, deny, ask }
+    }
+
+    #[must_use]
+    pub fn allow(&self) -> &[String] {
+        &self.allow
+    }
+
+    #[must_use]
+    pub fn deny(&self) -> &[String] {
+        &self.deny
+    }
+
+    #[must_use]
+    pub fn ask(&self) -> &[String] {
+        &self.ask
     }
 }
 
@@ -486,7 +542,7 @@ impl McpServerConfig {
             Self::Http(_) => McpTransport::Http,
             Self::Ws(_) => McpTransport::Ws,
             Self::Sdk(_) => McpTransport::Sdk,
-            Self::ManagedProxy(_) => McpTransport::ManagedProxy,
+            Self::ClaudeAiProxy(_) => McpTransport::ClaudeAiProxy,
         }
     }
 }
@@ -494,7 +550,7 @@ impl McpServerConfig {
 fn read_optional_json_object(
     path: &Path,
 ) -> Result<Option<BTreeMap<String, JsonValue>>, ConfigError> {
-    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
+    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claude.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -568,6 +624,32 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
         pre_tool_use: optional_string_array(hooks, "PreToolUse", "merged settings.hooks")?
             .unwrap_or_default(),
         post_tool_use: optional_string_array(hooks, "PostToolUse", "merged settings.hooks")?
+            .unwrap_or_default(),
+        post_tool_use_failure: optional_string_array(
+            hooks,
+            "PostToolUseFailure",
+            "merged settings.hooks",
+        )?
+        .unwrap_or_default(),
+    })
+}
+
+fn parse_optional_permission_rules(
+    root: &JsonValue,
+) -> Result<RuntimePermissionRuleConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RuntimePermissionRuleConfig::default());
+    };
+    let Some(permissions) = object.get("permissions").and_then(JsonValue::as_object) else {
+        return Ok(RuntimePermissionRuleConfig::default());
+    };
+
+    Ok(RuntimePermissionRuleConfig {
+        allow: optional_string_array(permissions, "allow", "merged settings.permissions")?
+            .unwrap_or_default(),
+        deny: optional_string_array(permissions, "deny", "merged settings.permissions")?
+            .unwrap_or_default(),
+        ask: optional_string_array(permissions, "ask", "merged settings.permissions")?
             .unwrap_or_default(),
     })
 }
@@ -724,10 +806,12 @@ fn parse_mcp_server_config(
         "sdk" => Ok(McpServerConfig::Sdk(McpSdkServerConfig {
             name: expect_string(object, "name", context)?.to_string(),
         })),
-        "claudeai-proxy" => Ok(McpServerConfig::ManagedProxy(McpManagedProxyServerConfig {
-            url: expect_string(object, "url", context)?.to_string(),
-            id: expect_string(object, "id", context)?.to_string(),
-        })),
+        "claudeai-proxy" => Ok(McpServerConfig::ClaudeAiProxy(
+            McpClaudeAiProxyServerConfig {
+                url: expect_string(object, "url", context)?.to_string(),
+                id: expect_string(object, "id", context)?.to_string(),
+            },
+        )),
         other => Err(ConfigError::Parse(format!(
             "{context}: unsupported MCP server type for {server_name}: {other}"
         ))),
@@ -940,7 +1024,7 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 mod tests {
     use super::{
         ConfigLoader, ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode,
-        CLAW_SETTINGS_SCHEMA_NAME,
+        CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -959,7 +1043,7 @@ mod tests {
     fn rejects_non_object_settings_files() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".claude");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), "[]").expect("write bad settings");
@@ -975,35 +1059,35 @@ mod tests {
     }
 
     #[test]
-    fn loads_and_merges_claw_code_config_files_by_precedence() {
+    fn loads_and_merges_claude_code_config_files_by_precedence() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.parent().expect("home parent").join(".claw.json"),
+            home.parent().expect("home parent").join(".claude.json"),
             r#"{"model":"haiku","env":{"A":"1"},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
         )
         .expect("write user compat config");
         fs::write(
             home.join("settings.json"),
-            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan"}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".claw.json"),
+            cwd.join(".claude.json"),
             r#"{"model":"project-compat","env":{"B":"2"}}"#,
         )
         .expect("write project compat config");
         fs::write(
-            cwd.join(".claw").join("settings.json"),
-            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
+            cwd.join(".claude").join("settings.json"),
+            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".claude").join("settings.local.json"),
             r#"{"model":"opus","permissionMode":"acceptEdits"}"#,
         )
         .expect("write local settings");
@@ -1012,7 +1096,7 @@ mod tests {
             .load()
             .expect("config should load");
 
-        assert_eq!(CLAW_SETTINGS_SCHEMA_NAME, "SettingsSchema");
+        assert_eq!(CLAUDE_CODE_SETTINGS_SCHEMA_NAME, "SettingsSchema");
         assert_eq!(loaded.loaded_entries().len(), 5);
         assert_eq!(loaded.loaded_entries()[0].source, ConfigSource::User);
         assert_eq!(
@@ -1044,6 +1128,16 @@ mod tests {
             .contains_key("PostToolUse"));
         assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
         assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
+        assert_eq!(
+            loaded.hooks().post_tool_use_failure(),
+            &["project-failure".to_string()]
+        );
+        assert_eq!(loaded.permission_rules().allow(), &["Read".to_string()]);
+        assert_eq!(
+            loaded.permission_rules().deny(),
+            &["Bash(rm -rf)".to_string()]
+        );
+        assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
 
@@ -1054,12 +1148,12 @@ mod tests {
     fn parses_sandbox_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".claude").join("settings.local.json"),
             r#"{
               "sandbox": {
                 "enabled": true,
@@ -1092,8 +1186,8 @@ mod tests {
     fn parses_typed_mcp_and_oauth_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1130,7 +1224,7 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".claude").join("settings.local.json"),
             r#"{
               "mcpServers": {
                 "remote-server": {
@@ -1183,8 +1277,8 @@ mod tests {
     fn parses_plugin_config_from_enabled_plugins() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1221,8 +1315,8 @@ mod tests {
     fn parses_plugin_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1273,7 +1367,7 @@ mod tests {
     fn rejects_invalid_mcp_server_shapes() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".claude");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
