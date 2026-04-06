@@ -1,8 +1,6 @@
 # Rewriting Project Claw Code
 
-<p align="center">
-  <a href="https://github.com/sponsors/emmarktech"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github&style=for-the-badge" alt="Sponsor on GitHub" /></a>
-</p>
+
 <p align="center">
   <a href="https://star-history.com/#emmarktech/claw-code&Date">
     <picture>
@@ -117,6 +115,37 @@ The new Python `src/` tree currently provides:
 ## 💬 Support / Questions
 
 For questions, discussions, or collaboration:
+
+<p align="center">
+  <a href="https://github.com/sponsors/emmarktech"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github&style=for-the-badge" alt="Sponsor on GitHub" /></a>
+</p>
+
+### 🪙 Wallets
+
+**BTC**
+
+```
+bc1qhqf749x9v9f6rwxg8nzvjl853an3jyga2d5d4h
+```
+
+**SOL**
+
+```
+XN7LB9uDN4c6DwrYj9uoWftyXu4W8mccDuW4Z1e8X3E
+```
+
+**EVM**
+
+```
+0x8ACFFa2d2e87cfce550aA42dac206831e1CD8b46
+```
+
+<p align="center">
+  <em>Click the address to easily copy</em>
+</p>
+
+
+---
 
 👉 Telegram: https://t.me/emmarktech
 
